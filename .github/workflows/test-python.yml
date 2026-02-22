@@ -1,0 +1,72 @@
+name: Python Tests
+
+on:
+  workflow_call:
+    inputs:
+      test_path:
+        description: 'Path to test directory (e.g. tests/unit/)'
+        type: string
+        default: 'tests/'
+      python_version:
+        description: 'Python version'
+        type: string
+        default: '3.12'
+      package_manager:
+        description: 'Package manager: "uv" or "pip"'
+        type: string
+        default: 'uv'
+      install_command:
+        description: 'Custom install command (overrides package_manager default)'
+        type: string
+        default: ''
+      test_command:
+        description: 'Custom test command (overrides default pytest)'
+        type: string
+        default: ''
+      artifact_name:
+        description: 'Name for the test results artifact'
+        type: string
+        default: 'pytest-results'
+      cpu_only_torch:
+        description: 'Use CPU-only PyTorch index to save CI time'
+        type: boolean
+        default: false
+      ref:
+        description: 'Git ref to checkout'
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    env:
+      UV_EXTRA_INDEX_URL: ${{ inputs.cpu_only_torch && 'https://download.pytorch.org/whl/cpu' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: astral-sh/setup-uv@v4
+        if: inputs.package_manager == 'uv'
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - uses: actions/setup-python@v5
+        if: inputs.package_manager == 'pip'
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install_command || (inputs.package_manager == 'uv' && 'uv sync --extra dev' || 'pip install -e ".[dev]"') }}
+
+      - name: Run tests
+        run: ${{ inputs.test_command || format('{0} pytest {1} -v --tb=short --junitxml=pytest-results.xml', (inputs.package_manager == 'uv' && 'uv run' || ''), inputs.test_path) }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: pytest-results.xml
+          retention-days: 7

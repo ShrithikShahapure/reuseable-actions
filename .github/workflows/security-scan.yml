@@ -1,0 +1,228 @@
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      enable_trivy:
+        description: 'Run Trivy filesystem scan'
+        type: boolean
+        default: true
+      enable_gosec:
+        description: 'Run gosec (Go static analysis)'
+        type: boolean
+        default: false
+      go_scan_path:
+        description: 'Go package path for gosec (e.g. ./internal/...)'
+        type: string
+        default: './...'
+      enable_bandit:
+        description: 'Run Bandit (Python static analysis)'
+        type: boolean
+        default: false
+      python_scan_paths:
+        description: 'Space-separated paths for Bandit (e.g. "src/ scripts/")'
+        type: string
+        default: 'src/'
+      enable_npm_audit:
+        description: 'Run npm audit'
+        type: boolean
+        default: false
+      node_working_directory:
+        description: 'Working directory for npm audit (e.g. frontend/)'
+        type: string
+        default: '.'
+      node_version:
+        description: 'Node.js version'
+        type: string
+        default: '20'
+      python_version:
+        description: 'Python version'
+        type: string
+        default: '3.12'
+      severity:
+        description: 'Trivy severity filter'
+        type: string
+        default: 'CRITICAL,HIGH'
+      fail_on_critical:
+        description: 'Fail the job if CRITICAL vulnerabilities are found'
+        type: boolean
+        default: true
+      post_pr_comment:
+        description: 'Post a summary comment to the PR'
+        type: boolean
+        default: true
+
+jobs:
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Tool setup ──────────────────────────────────────────────────────────
+      - uses: actions/setup-go@v5
+        if: inputs.enable_gosec
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        if: inputs.enable_bandit
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - uses: actions/setup-node@v4
+        if: inputs.enable_npm_audit
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install bandit
+        if: inputs.enable_bandit
+        run: pip install bandit[sarif]
+
+      # ── Seed empty SARIF stubs ──────────────────────────────────────────────
+      - name: Seed empty SARIF stubs
+        run: |
+          for f in trivy-results.sarif gosec-results.sarif bandit-results.sarif; do
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"stub","rules":[]}},"results":[]}]}' > "$f"
+          done
+
+      # ── Trivy ───────────────────────────────────────────────────────────────
+      - name: Trivy filesystem scan (SARIF)
+        if: inputs.enable_trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ inputs.severity }}
+
+      - name: Upload Trivy SARIF
+        if: always() && inputs.enable_trivy
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-fs
+
+      # ── gosec ───────────────────────────────────────────────────────────────
+      - name: Run gosec
+        if: always() && inputs.enable_gosec
+        uses: securego/gosec@master
+        with:
+          args: -fmt sarif -out gosec-results.sarif ${{ inputs.go_scan_path }}
+        continue-on-error: true
+
+      - name: Fix gosec SARIF schema
+        if: always() && inputs.enable_gosec
+        run: |
+          if [ -f gosec-results.sarif ]; then
+            jq 'walk(if type == "object" and has("relationships") then del(.relationships) else . end)' \
+              gosec-results.sarif > gosec-fixed.sarif && mv gosec-fixed.sarif gosec-results.sarif
+          fi
+
+      - name: Upload gosec SARIF
+        if: always() && inputs.enable_gosec
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec-results.sarif
+          category: gosec
+
+      # ── Bandit ──────────────────────────────────────────────────────────────
+      - name: Run bandit
+        if: always() && inputs.enable_bandit
+        run: bandit -r ${{ inputs.python_scan_paths }} -f sarif -o bandit-results.sarif --severity-level medium || true
+
+      - name: Upload bandit SARIF
+        if: always() && inputs.enable_bandit
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+      # ── npm audit ───────────────────────────────────────────────────────────
+      - name: npm audit
+        if: always() && inputs.enable_npm_audit
+        working-directory: ${{ inputs.node_working_directory }}
+        run: npm audit --audit-level=high || true
+
+      # ── PR comment summary ─────────────────────────────────────────────────
+      - name: Post security summary to PR
+        if: always() && inputs.post_pr_comment && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            function countSarif(path) {
+              try {
+                const sarif = JSON.parse(fs.readFileSync(path, 'utf8'));
+                let total = 0, bySeverity = {};
+                for (const run of sarif.runs || []) {
+                  for (const result of run.results || []) {
+                    total++;
+                    const level = result.level || 'warning';
+                    bySeverity[level] = (bySeverity[level] || 0) + 1;
+                  }
+                }
+                return { total, bySeverity };
+              } catch { return { total: 0, bySeverity: {} }; }
+            }
+            function icon(n) { return n === 0 ? ':white_check_mark:' : ':warning:'; }
+            function badge(s) {
+              const p = [];
+              if (s.error)   p.push(`${s.error} critical`);
+              if (s.warning) p.push(`${s.warning} high`);
+              if (s.note)    p.push(`${s.note} medium`);
+              return p.length ? p.join(', ') : 'None';
+            }
+
+            const rows = [];
+            if (${{ inputs.enable_trivy }}) {
+              const r = countSarif('trivy-results.sarif');
+              rows.push(`| ${icon(r.total)} **Trivy** | ${r.total} | ${badge(r.bySeverity)} |`);
+            }
+            if (${{ inputs.enable_gosec }}) {
+              const r = countSarif('gosec-results.sarif');
+              rows.push(`| ${icon(r.total)} **gosec** | ${r.total} | ${badge(r.bySeverity)} |`);
+            }
+            if (${{ inputs.enable_bandit }}) {
+              const r = countSarif('bandit-results.sarif');
+              rows.push(`| ${icon(r.total)} **Bandit** | ${r.total} | ${badge(r.bySeverity)} |`);
+            }
+
+            const body = [
+              '## Security Scan Summary',
+              '',
+              '| Scanner | Findings | Details |',
+              '|---------|:--------:|---------|',
+              ...rows,
+              '',
+              `> [Full details](/${context.repo.owner}/${context.repo.repo}/security/code-scanning) | [Workflow run](/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes('Security Scan Summary'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # ── Fail gate ──────────────────────────────────────────────────────────
+      - name: Fail on CRITICAL
+        if: always() && inputs.fail_on_critical && inputs.enable_trivy
+        env:
+          TRIVY_FORMAT: table
+          TRIVY_OUTPUT: ''
+          TRIVY_SEVERITY: CRITICAL
+          TRIVY_EXIT_CODE: '1'
+        run: trivy fs --exit-code 1 --severity CRITICAL --format table .

@@ -1,0 +1,169 @@
+name: Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      terraform_dir:
+        description: 'Directory containing Terraform files'
+        type: string
+        default: 'terraform'
+      aws_region:
+        description: 'AWS region'
+        type: string
+        default: 'us-east-1'
+      aws_role_arn:
+        description: 'IAM role ARN to assume via OIDC'
+        type: string
+        required: true
+      post_pr_comment:
+        description: 'Post plan output as PR comment'
+        type: boolean
+        default: true
+      post_cost_estimate:
+        description: 'Post AWS cost estimate as PR comment'
+        type: boolean
+        default: true
+    secrets:
+      TF_API_TOKEN:
+        description: 'Terraform Cloud API token (optional — omit for local backend)'
+        required: false
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    env:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Terraform Init
+        run: terraform -chdir=${{ inputs.terraform_dir }} init
+
+      - name: Terraform Format Check
+        run: terraform -chdir=${{ inputs.terraform_dir }} fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform -chdir=${{ inputs.terraform_dir }} validate
+
+      - name: Terraform Plan
+        id: plan
+        continue-on-error: true
+        run: terraform -chdir=${{ inputs.terraform_dir }} plan -no-color -input=false -detailed-exitcode
+
+      - name: Post Terraform Plan to PR
+        if: always() && inputs.post_pr_comment && github.event_name == 'pull_request'
+        uses: robburger/terraform-pr-commenter@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          commenter_type: plan
+          commenter_input: ${{ format('{0}{1}', steps.plan.outputs.stdout, steps.plan.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.plan.outputs.exitcode }}
+
+      - name: Calculate cost estimate
+        id: cost
+        if: inputs.post_cost_estimate && github.event_name == 'pull_request'
+        env:
+          PLAN_OUT: ${{ steps.plan.outputs.stdout }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          python3 - << 'PYEOF'
+          import re, json, os
+
+          plan = os.environ.get("PLAN_OUT", "")
+          region = os.environ.get("AWS_REGION", "us-east-1")
+
+          created = re.findall(r'#\s+([\w.]+)\s+will be (created|updated|replaced)', plan)
+          resource_types = [addr.rsplit('.', 2)[-2] for addr, _ in created]
+
+          def count(rtype):
+              return resource_types.count(rtype)
+
+          instance_match = re.search(r'instance_types\s*=\s*\[\s*"([^"]+)"', plan)
+          instance_type  = instance_match.group(1) if instance_match else "m5.xlarge"
+          desired_match  = re.search(r'desired_size\s*=\s*(\d+)', plan)
+          node_count     = int(desired_match.group(1)) if desired_match else 2
+          disk_match     = re.search(r'disk_size\s*=\s*(\d+)', plan)
+          disk_gb        = int(disk_match.group(1)) if disk_match else 50
+
+          EC2 = {"m5.xlarge": 0.192, "m5.large": 0.096, "m5.2xlarge": 0.384,
+                 "t3.medium": 0.0416, "t3.large": 0.0832, "t3.xlarge": 0.1664}
+          EBS = 0.10
+          items = []
+
+          if count("aws_eks_cluster"):
+              items.append(("EKS control plane", count("aws_eks_cluster"), 0.10))
+          if count("aws_eks_node_group"):
+              p = EC2.get(instance_type, 0.192)
+              items.append((f"EC2 {instance_type} x {node_count} nodes", node_count, p))
+              items.append((f"EBS gp2 {disk_gb} GB x {node_count} nodes", 1, (disk_gb * EBS * node_count) / 730))
+          if count("aws_nat_gateway"):
+              items.append(("NAT Gateway", count("aws_nat_gateway"), 0.045))
+          if count("aws_db_instance"):
+              items.append(("RDS instance", count("aws_db_instance"), 0.10))
+          if count("aws_elasticache_cluster"):
+              items.append(("ElastiCache", count("aws_elasticache_cluster"), 0.068))
+
+          total_h = sum(q * u for _, q, u in items)
+          result = {
+              "total_daily": round(total_h * 24, 2),
+              "total_monthly": round(total_h * 730, 2),
+              "items": [{"label": l, "daily": round(q*u*24, 2), "monthly": round(q*u*730, 2)} for l, q, u in items],
+              "instance_type": instance_type, "node_count": node_count, "region": region,
+          }
+          with open("/tmp/cost.json", "w") as f:
+              json.dump(result, f)
+          PYEOF
+
+      - name: Post cost estimate to PR
+        if: inputs.post_cost_estimate && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('/tmp/cost.json', 'utf8'));
+            const rows = data.items
+              .filter(i => i.monthly > 0)
+              .sort((a, b) => b.monthly - a.monthly)
+              .map(i => `| ${i.label} | $${i.daily.toFixed(2)} | $${i.monthly.toFixed(2)} |`)
+              .join('\n');
+            const body = [
+              '## Infrastructure Cost Estimate',
+              `> ${data.region} · ${data.node_count}x ${data.instance_type} nodes · on-demand pricing`,
+              '', '| Period  | Estimated cost |', '|---------|---------------|',
+              `| 1 day   | **$${data.total_daily.toFixed(2)}** |`,
+              `| 1 month | **$${data.total_monthly.toFixed(2)}** |`,
+              '', '<details>', '<summary>Per-resource breakdown</summary>', '',
+              '| Resource | 1 day | 1 month |', '|----------|------:|--------:|',
+              rows,
+              `| **Total** | **$${data.total_daily.toFixed(2)}** | **$${data.total_monthly.toFixed(2)}** |`,
+              '</details>', '',
+              '_Prices are estimated. Excludes data transfer._',
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes('Infrastructure Cost Estimate'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
