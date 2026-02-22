@@ -12,9 +12,9 @@ on:
         type: string
         default: 'us-east-1'
       aws_role_arn:
-        description: 'IAM role ARN to assume via OIDC'
+        description: 'IAM role ARN (use secrets.AWS_ROLE_ARN if sensitive)'
         type: string
-        required: true
+        default: ''
       approvers:
         description: 'Comma-separated GitHub usernames for manual approval'
         type: string
@@ -26,6 +26,9 @@ on:
     secrets:
       TF_API_TOKEN:
         description: 'Terraform Cloud API token (optional)'
+        required: false
+      AWS_ROLE_ARN:
+        description: 'IAM role ARN (alternative to inputs.aws_role_arn)'
         required: false
 
 jobs:
@@ -54,7 +57,7 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Terraform Init
@@ -104,7 +107,7 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Terraform Init
