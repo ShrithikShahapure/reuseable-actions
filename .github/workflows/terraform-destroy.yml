@@ -59,6 +59,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
+          role-duration-seconds: 7200
 
       - name: Terraform Init
         run: terraform -chdir=${{ inputs.terraform_dir }} init
@@ -109,6 +110,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
+          role-duration-seconds: 7200
 
       - name: Terraform Init
         run: terraform -chdir=${{ inputs.terraform_dir }} init
