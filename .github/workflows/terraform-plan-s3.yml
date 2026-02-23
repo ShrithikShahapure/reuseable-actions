@@ -31,11 +31,21 @@ on:
       AWS_ROLE_ARN:
         description: 'IAM role ARN (alternative to inputs.aws_role_arn when it contains secrets)'
         required: false
+    outputs:
+      plan_summary:
+        description: 'Truncated plan summary (last ~35 lines)'
+        value: ${{ jobs.plan.outputs.plan_summary }}
+      cost_table:
+        description: 'Formatted cost estimate markdown table'
+        value: ${{ jobs.plan.outputs.cost_table }}
 
 jobs:
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
+    outputs:
+      plan_summary: ${{ steps.plan-summary.outputs.summary }}
+      cost_table: ${{ steps.cost-format.outputs.table }}
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +81,17 @@ jobs:
         run: |
           terraform -chdir=${{ inputs.terraform_dir }} plan -no-color -input=false 2>&1 | tee /tmp/plan.txt
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract plan summary
+        if: ${{ !inputs.validate_only }}
+        id: plan-summary
+        run: |
+          SUMMARY=$(tail -40 /tmp/plan.txt | head -35)
+          {
+            echo "summary<<EOFPLAN"
+            echo "$SUMMARY"
+            echo "EOFPLAN"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Post Terraform Plan to PR
         if: ${{ !inputs.validate_only && always() && inputs.post_pr_comment && github.event_name == 'pull_request' }}
@@ -112,7 +133,7 @@ jobs:
 
       - name: Calculate cost estimate
         id: cost
-        if: ${{ !inputs.validate_only && inputs.post_cost_estimate && github.event_name == 'pull_request' }}
+        if: ${{ !inputs.validate_only && inputs.post_cost_estimate }}
         run: |
           python3 - << 'PYEOF'
           import re, json, os
@@ -164,6 +185,36 @@ jobs:
           PYEOF
         env:
           AWS_REGION: ${{ inputs.aws_region }}
+
+      - name: Format cost for output
+        id: cost-format
+        if: ${{ !inputs.validate_only && inputs.post_cost_estimate }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+
+          data = json.load(open("/tmp/cost.json"))
+          lines = []
+          lines.append(f"> {data['region']} · {data['node_count']}x {data['instance_type']} nodes · on-demand pricing")
+          lines.append("")
+          lines.append("| Period | Estimated Cost |")
+          lines.append("|--------|---------------|")
+          lines.append(f"| Daily | **${data['total_daily']:.2f}** |")
+          lines.append(f"| Monthly | **${data['total_monthly']:.2f}** |")
+          lines.append("")
+          lines.append("| Resource | Daily | Monthly |")
+          lines.append("|----------|------:|--------:|")
+          for i in data["items"]:
+              if i["monthly"] > 0:
+                  lines.append(f"| {i['label']} | ${i['daily']:.2f} | ${i['monthly']:.2f} |")
+          lines.append(f"| **Total** | **${data['total_daily']:.2f}** | **${data['total_monthly']:.2f}** |")
+          table = "\n".join(lines)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("table<<EOFCOST\n")
+              f.write(table + "\n")
+              f.write("EOFCOST\n")
+          PYEOF
 
       - name: Post cost estimate to PR
         if: ${{ !inputs.validate_only && inputs.post_cost_estimate && github.event_name == 'pull_request' }}
