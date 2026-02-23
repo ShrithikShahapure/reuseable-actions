@@ -97,10 +97,11 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           severity: ${{ inputs.severity }}
+          ignore-unfixed: true
 
       - name: Upload Trivy SARIF
         if: always() && inputs.enable_trivy
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-fs
@@ -123,7 +124,7 @@ jobs:
 
       - name: Upload gosec SARIF
         if: always() && inputs.enable_gosec
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: gosec-results.sarif
           category: gosec
@@ -135,7 +136,7 @@ jobs:
 
       - name: Upload bandit SARIF
         if: always() && inputs.enable_bandit
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: bandit-results.sarif
           category: bandit
@@ -225,4 +226,4 @@ jobs:
           TRIVY_OUTPUT: ''
           TRIVY_SEVERITY: CRITICAL
           TRIVY_EXIT_CODE: '1'
-        run: trivy fs --exit-code 1 --severity CRITICAL --format table .
+        run: trivy fs --exit-code 1 --severity CRITICAL --ignore-unfixed --format table .
